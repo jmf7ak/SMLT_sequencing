@@ -1,0 +1,452 @@
+---
+title: "sami_differential_expression"
+output: html_document
+---
+
+```{r}
+setwd("C:/Users/jmf7ak/OneDrive - University of Virginia/25_SPRING/SAMI")
+# Load required packages
+library(DESeq2)
+library(ggplot2)
+library(ggrepel)
+library(pheatmap)
+library(dplyr)
+library(stringr)
+
+```
+
+```{r}
+count_dir <- "C:/Users/jmf7ak/OneDrive - University of Virginia/25_SPRING/SAMI/counts_trimmed_new"
+# switch for counts folder if you want the trimmed verisons
+
+# Get list of all count files
+file_list <- list.files(count_dir, pattern = "*.txt", full.names = TRUE)
+
+# delete enz3
+file_list <- setdiff(file_list, "C:/Users/jmf7ak/OneDrive - University of Virginia/25_SPRING/SAMI/counts_trimmed_new/PA14_Enz3_S96_counts.txt")
+
+#file_list = file_list[-c(1:3, 7:9)]
+# Extract sample names and group labels
+sample_names <- gsub(".txt$", "", basename(file_list))
+conditions <- ifelse(grepl("Reg", sample_names), "Reg", "Enz")
+
+```
+
+```{r}
+# Read count files and extract the 7th column
+count_data <- lapply(file_list, function(file) {
+    df <- read.delim(file, header = TRUE, sep = "\t", check.names = FALSE)
+    df[, 7, drop = FALSE]  # Extract only the 7th column
+})
+
+# Combine into a single matrix
+count_matrix <- do.call(cbind, count_data)
+colnames(count_matrix) <- sample_names
+
+# Ensure row names are gene names (assuming the first column is gene IDs)
+rownames(count_matrix) <- read.delim(file_list[1], header = TRUE, sep = "\t")[,1]
+```
+
+```{r}
+# Create DESeq2 dataset
+col_data <- data.frame(row.names = colnames(count_matrix), condition = conditions)%>%
+  mutate(batch = if_else(str_sub(colnames(count_matrix), 9, 9) %in% c("1", "2", "3"), 1, 2))
+
+dds <- DESeqDataSetFromMatrix(countData = count_matrix, colData = col_data, design = ~batch + condition)
+
+# Run DESeq2
+dds <- DESeq(dds)
+res <- results(dds, contrast = c('condition', 'Enz', 'Reg'))
+```
+
+```{r}
+library(limma)
+
+# Plot PCA
+vsd <- vst(dds, blind = FALSE)  # Variance stabilizing transformation
+corrected_counts <- removeBatchEffect(assay(vsd), batch = col_data$batch)
+
+pca_data <- plotPCA(vsd, intgroup = "condition", returnData = TRUE)
+percentVar <- round(100 * attr(pca_data, "percentVar"))
+pca_data$name <- sub("^[^_]*_([^_]*)_.*$", "\\1", pca_data$name)
+ggplot(pca_data, aes(x = PC1, y = PC2, color = condition, label = name)) +
+  geom_point(size = 4) +
+  geom_text_repel() +
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+  theme_minimal()
+
+
+# After
+library(ggplot2)
+pca <- prcomp(t(corrected_counts))
+var_explained <- pca$sdev^2 / sum(pca$sdev^2)
+pc1_var <- round(var_explained[1] * 100, 1)
+pc2_var <- round(var_explained[2] * 100, 1)
+
+pc_df <- as.data.frame(pca$x)
+pc_df$condition <- col_data$condition
+pc_df$batch <- col_data$batch
+pc_df$sample <- rownames(pc_df)
+pc_df$sample <- sub("^[^_]*_([^_]*)_.*$", "\\1", pc_df$sample)
+ggplot(pc_df, aes(PC1, PC2, color = condition, label = sample)) +
+  geom_point(size = 3) +
+  geom_text_repel(size = 3) + 
+  xlab(paste0("PC1 (", pc1_var, "%)")) +
+  ylab(paste0("PC2 (", pc2_var, "%)")) +
+  theme_minimal()
+
+ggplot(pc_df, aes(x = PC1, y = PC2, color = condition, shape = factor(batch), label = sample)) +
+  geom_point(size = 3) +
+  # geom_text_repel(size = 3) +  # optional: add sample labels without overlap
+  theme_minimal() +
+  scale_shape_manual(values = c(16, 17), name = "Batch") +  # shapes for batches
+  scale_color_manual(
+    values = c("Enz" = "blue", "Reg" = "red"),  # assign colors
+    labels = c("Enz" = "Smlt1473", "Reg" = "Untreated"),  # custom legend labels
+    name = "Condition"
+  ) +
+   theme(
+    plot.title      = element_text(size = 18, face = "bold"),
+    axis.title      = element_text(size = 14, face = "bold"),
+    axis.text       = element_text(size = 12, face = "bold"),
+    legend.title    = element_text(size = 14, face = "bold"),
+    legend.text     = element_text(size = 12, face = "bold")
+  ) 
+ggsave(
+  "PCA_plot_Sami.png",
+  dpi = 600,        # High resolution
+  width = 6,
+  height = 5,
+  units = "in"
+)
+```
+```{r}
+library(vegan)
+perma_mat <- t(corrected_counts)
+stopifnot(rownames(perma_mat) == rownames(col_data))
+dist_mat <- dist(perma_mat, method = "euclidean")
+
+permanova <- adonis2(
+  dist_mat ~ condition + batch,
+  data = col_data,
+  permutations = 999
+)
+
+permanova
+```
+
+```{r}
+pca_result = pca
+
+# Get the loadings for PC2
+loadings_pc2 <- pca_result$rotation[, 2]
+
+# Sort genes by their absolute contribution to PC2
+important_genes_pc2 <- sort(abs(loadings_pc2), decreasing = TRUE)
+
+# View the top 10 most important genes
+head(important_genes_pc2, 10)
+```
+
+
+
+```{r}
+
+# Convert DESeq2 results to a data frame
+res_df <- as.data.frame(res)
+data = subset(res_df, padj < 0.05 & abs(log2FoldChange) > 1)
+
+# Add significance column
+res_df$significance <- ifelse(res_df$padj < 0.05 & abs(res_df$log2FoldChange) > 1, "Significant", "Not Significant")
+
+# Plot Volcano
+ggplot(res_df, aes(x = log2FoldChange, y = -log10(padj), color = significance)) +
+  geom_point(alpha = 0.7) +
+  scale_color_manual(values = c("Significant" = "red", "Not Significant" = "gray")) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "black") +  # Fold change threshold
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") +  # p-value threshold
+  theme_minimal() +
+  labs(title = "Volcano Plot", x = "Log2 Fold Change", y = "-Log10 Adjusted p-value") +
+  theme(legend.position = "top") +
+  geom_text_repel(data = subset(res_df, padj < 0.05 & abs(log2FoldChange) > 1),
+                  aes(label = rownames(data)), size = 3, arrow = arrow(length = unit(0.010, "npc")),nudge_x = .1 ,nudge_y = .5,)
+
+ggsave(
+  "DE_plot_Sami.png",
+  dpi = 600,        # High resolution
+  width = 6,
+  height = 5,
+  units = "in"
+)
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+
+# Convert DESeq2 results to data frame
+res_df <- as.data.frame(res)
+
+# Add significance column
+res_df <- res_df %>%
+  mutate(
+    significance = case_when(
+      padj < 0.05 & log2FoldChange < -1 ~ "Downregulated",
+      padj < 0.05 & log2FoldChange > 1  ~ "Upregulated",
+      TRUE ~ "Not Significant"
+    )
+  )
+
+# Subset for downregulated genes
+down_df <- subset(res_df, significance == "Downregulated")
+
+# Compare baseMean (average normalized counts) between downregulated vs not significant
+ggplot(res_df, aes(x = significance, y = baseMean)) +
+  geom_boxplot(aes(fill = significance), alpha = 0.6, outlier.shape = NA) +
+  geom_jitter(width = 0.2, alpha = 0.5) +
+  scale_y_log10() +
+  theme_minimal() +
+  labs(
+    title = "Comparison of gene abundance",
+    x = "Gene category",
+    y = "Mean normalized counts (log10)"
+  ) +
+  scale_fill_manual(values = c("Downregulated" = "red", "Upregulated" = "blue", "Not Significant" = "gray"))
+
+# Optional: statistical test to see if downregulated genes are lower abundance
+down_vs_not <- res_df %>%
+  filter(significance %in% c("Downregulated", "Not Significant"))
+
+wilcox.test(baseMean ~ significance, data = down_vs_not)
+
+```
+
+```{r top 20 expressed genees}
+enz_counts <- count_matrix[,1:3]
+reg_counts <- count_matrix[,4:6]
+
+enz_top <- apply(enz_counts, 1, median) %>%
+  sort(decreasing = TRUE) %>%
+  head(15)
+
+reg_top <- apply(reg_counts, 1, median) %>%
+  sort(decreasing = TRUE) %>%
+  head(15)
+
+# Print results
+print(enz_top)
+print(reg_top)
+
+```
+```{r}
+genes_of_interest <- rownames(count_matrix)[rowSums(reg_counts == 0) == ncol(reg_counts) & rowSums(enz_counts > 0) > 0]
+
+print(genes_of_interest)
+
+filtered_reg_counts <- reg_counts[genes_of_interest, ]
+filtered_enz_counts <- enz_counts[genes_of_interest, ]
+
+print("Genes with zero counts in reg condition and non-zero counts in enz condition:")
+print("Counts in Reg Condition:")
+print(filtered_reg_counts)
+
+print("Counts in Enz Condition:")
+print(filtered_enz_counts)
+```
+
+```{r}
+# Load required packages
+library(pheatmap)  # For heatmap clustering
+library(ggplot2)   # For alternative visualization
+library(RColorBrewer) # For better color scaling
+
+# Convert raw counts to Reads Per Million (RPM)
+count_matrix <- as.matrix(count_matrix)  # Ensure it's a matrix
+rpm_matrix <- sweep(count_matrix, 2, colSums(count_matrix) / 1e6, FUN = "/") # Normalize each column
+log_rpm = log2(rpm_matrix + 1)
+expr_corrected <- removeBatchEffect(log_rpm, batch = col_data$batch, design = model.matrix(~ conditions))
+```
+
+```{r}
+# Calculate distance matrix (Euclidean or correlation-based)
+dist_matrix <- dist(t(expr_corrected), method = "euclidean")  # Transpose to cluster samples
+
+# Perform hierarchical clustering
+hc <- hclust(dist_matrix, method = "ward.D2")
+
+# Plot the dendrogram
+plot(hc, main = "Hierarchical Clustering of Samples (RPM-normalized)", 
+     xlab = "Samples", sub = "", cex = 0.8)
+```
+
+```{r}
+# Scale the RPM matrix for better visualization
+scaled_rpm <- t(scale(t(expr_corrected)))  # Log-transform and scale
+
+# Heatmap with hierarchical clustering
+pheatmap(scaled_rpm, 
+         clustering_distance_rows = "euclidean", 
+         clustering_distance_cols = "euclidean", 
+         clustering_method = "ward.D2",
+         scale = "row",
+         color = colorRampPalette(rev(brewer.pal(n = 9, name = "RdBu")))(100),
+         main = "Hierarchical Clustering Heatmap (RPM-normalized)",
+         show_rownames = FALSE)
+```
+
+```{r}
+total_counts <- colSums(count_matrix)
+# Convert to a data frame for ggplot
+#df <- data.frame(Sample = names(total_counts), TotalCounts = total_counts)%>% mutate(group = ifelse(grepl("Enz", rownames(df)), "Enz", "Reg"))
+df <- df %>%
+  mutate(
+    batch_char = substr(Sample, 9, 9),
+    batch = case_when(
+      batch_char %in% c("1", "2", "3") ~ "batch1",
+      batch_char %in% c("4", "5", "6") ~ "batch2",
+      TRUE ~ NA_character_
+    )
+  )
+
+ggplot(df, aes(x = group, y = TotalCounts)) +
+  geom_boxplot(aes(fill = group), alpha = 0.6, outlier.shape = NA) +
+  geom_jitter(aes(color = batch), width = 0.2, size = 2, alpha = 0.8) +
+  labs(
+    title = "Total Counts per Sample",
+    y = "Total Counts",
+    x = ""
+  ) +
+  theme_minimal()
+
+
+
+
+```
+```{r}
+library(readxl)
+
+# Read in the Excel file
+sig_genes <- read_excel("sami_significant.xlsx")
+
+# Example using biomaRt (if standard IDs are used)
+# If PA14, we'll likely need a local annotation or use UniProt mapping
+
+library(clusterProfiler)
+library(org.Paeruginosa.PA01.eg.db)  # You may need a PA14-specific db or use annotation file
+
+# Suppose 'gene' column has gene names
+gene_list <- sig_genes$gene
+
+# Enrichment analysis
+ego <- enrichGO(gene          = gene_list,
+                OrgDb         = org.Paeruginosa.PAO1.eg.db,
+                keyType       = "SYMBOL",
+                ont           = "BP",
+                pAdjustMethod = "BH",
+                qvalueCutoff  = 0.05)
+
+# View results
+head(ego)
+```
+
+```{r}
+library(tidyr)
+library(readr)
+# Read in the file
+df <- read_tsv("featureCounts_assignment_plot.tsv")
+
+# Remove the row that contains 'Enz3'
+df <- df[!grepl("Enz3", df$Category), ]
+
+# Add a new column to group by "Enz" or "Reg"
+df <- df %>%
+  mutate(Group = ifelse(grepl("Enz", Category), "Smlt1473", "Untreated")) %>%
+  mutate(batch = c(1,1,1,2,2,1,1,1,2,2,2))
+
+# Reshape to long format
+df_long <- df %>%
+  pivot_longer(cols = -c(Category, Group), names_to = "Assignment", values_to = "Count")
+
+# Summarize by group and assignment
+df_summary <- df_long %>%
+  group_by(Group, Assignment) %>%
+  summarise(Total = sum(Count), .groups = "drop") %>%
+  group_by(Group) %>%
+  mutate(Percent = Total / sum(Total) * 100)
+
+df_summary$Assignment <- factor(df_summary$Assignment, levels = rev(unique(df_summary$Assignment)))
+# Plot
+ggplot(df_summary, aes(x = Group, y = Percent, fill = Assignment)) +
+  geom_bar(stat = "identity", position = "stack") +
+  labs(title = "Read Assignment by Group",
+       x = "Group", y = "Percentage", fill = "Assignment") +
+  theme_minimal()
+```
+```{r}
+df_long <- df %>%
+  pivot_longer(
+    cols = -c(Category, Group, batch),
+    names_to = "Assignment",
+    values_to = "Count"
+  )
+
+df_summary <- df_long %>%
+  group_by(Group, batch, Assignment) %>%
+  summarise(Total = sum(Count), .groups = "drop") %>%
+  group_by(Group, batch) %>%
+  mutate(Percent = Total / sum(Total) * 100)
+
+ggplot(df_summary, aes(x = Group, y = Percent, fill = Assignment)) +
+  geom_bar(stat = "identity", position = "stack") +
+  facet_grid(~ batch, switch = "x", scales = "free_x", space = "free_x") +
+  labs(title = "Read Assignment by Treatment and Batch",
+       x = "Batch", y = "Percentage", fill = "Assignment") +
+  theme_minimal() +
+  theme(
+    strip.placement = "outside",
+    strip.text      = element_text(size = 12, face = "bold"),
+    plot.title      = element_text(size = 18, face = "bold"),
+    axis.title      = element_text(size = 14, face = "bold"),
+    axis.text       = element_text(size = 12, face = "bold"),
+    legend.title    = element_text(size = 14, face = "bold"),
+    legend.text     = element_text(size = 12, face = "bold")
+  )
+```
+
+```{r}
+df_summary$GroupBatch <- factor(paste0(df_summary$Group, "_Batch", df_summary$batch),
+                                levels = unique(paste0(df_summary$Group, "_Batch", df_summary$batch)))
+
+# Define labels for nested effect
+group_labels <- unique(df_summary$Group)
+batch_labels <- unique(df_summary$batch)
+
+# Plot
+ggplot(df_summary, aes(x = GroupBatch, y = Percent, fill = Assignment)) +
+  geom_bar(stat = "identity", position = "stack") +
+  scale_x_discrete(
+    labels = function(x) {
+      # Split "Group_Batch" into two rows: "Group\nBatch X"
+      sapply(x, function(i) {
+        parts <- strsplit(i, "_Batch")[[1]]
+        paste0(parts[1], "\nBatch ", parts[2])
+      })
+    }
+  ) +
+  labs(title = "Read Assignment by Group and Batch",
+       x = "Group", y = "Percentage", fill = "Assignment") +
+  theme_minimal() +
+  theme(
+    plot.title  = element_text(size = 18, face = "bold"),
+    axis.title  = element_text(size = 14, face = "bold"),
+    axis.text   = element_text(size = 12, face = "bold"),
+    legend.title = element_text(size = 14, face = "bold"),
+    legend.text  = element_text(size = 12, face = "bold")
+  )
+```
+
+
+
+
